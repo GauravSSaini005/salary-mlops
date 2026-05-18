@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: salary-api
-          image: ghcr.io/YOUR_GITHUB_USERNAME/salary-mlops:latest
+          image: ghcr.io/gauravssaini005/salary-mlops:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 5000
