@@ -3,14 +3,15 @@
 #
 # Purpose:
 # Automatically monitor model quality and retrain only when needed.
+# Also handles merging of new data uploads automatically.
 #
 # Triggers:
 # 1. Weekly schedule
-# 2. Dataset updates
+# 2. Dataset updates (salary_data.csv OR updated_salary_data.csv)
 # 3. Manual trigger from GitHub Actions
 #
 # Pipeline Flow:
-# Check model performance
+# Check model performance + merge new data if present
 #        ↓
 # Retrain model if needed
 #        ↓
@@ -39,7 +40,9 @@ on:
     - cron: "0 2 * * 1"
 
   # ------------------------------------------------------------
-  # Trigger when dataset changes
+  # Trigger when either dataset file changes.
+  # updated_salary_data.csv is uploaded by the user with new data.
+  # salary_data.csv changing means data was already merged.
   # ------------------------------------------------------------
   push:
     branches:
@@ -71,14 +74,22 @@ jobs:
   # ============================================================
   # Job 1 — Check Current Model Performance
   #
-  # Evaluates the existing production model against
-  # the R2 threshold.
+  # This job does two things:
+  # 1. Merges updated_salary_data.csv into salary_data.csv
+  #    if a new upload file is detected. This always happens
+  #    regardless of whether retraining is needed.
+  # 2. Evaluates the existing model against the R2 threshold
+  #    and decides whether retraining is required.
+  #
+  # Key logic:
+  # - New data file detected → ALWAYS retrain (new data = new model)
+  # - Model R2 below 0.80   → retrain required
+  # - force_retrain=true     → retrain required
+  # - Model R2 above 0.80    → skip retraining
   #
   # Outputs:
-  # - needs_retraining
-  # - current_r2
-  #
-  # These outputs are consumed by downstream jobs.
+  # - needs_retraining (true/false)
+  # - current_r2 (numeric score)
   # ============================================================
 
   check-performance:
@@ -86,6 +97,14 @@ jobs:
     name: Check Current Model Performance
 
     runs-on: ubuntu-latest
+
+    # ----------------------------------------------------------
+    # Write permission is needed so this job can commit the
+    # merged salary_data.csv back to the repository and
+    # delete updated_salary_data.csv after merging.
+    # ----------------------------------------------------------
+    permissions:
+      contents: write
 
     outputs:
 
@@ -96,17 +115,19 @@ jobs:
     steps:
 
       # --------------------------------------------------------
-      # Checkout repository
+      # Checkout repository with token so we can push commits
+      # back after merging the new dataset
       # --------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # --------------------------------------------------------
       # Install Python
       # --------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
-
         with:
           python-version: "3.13"
 
@@ -117,18 +138,68 @@ jobs:
         run: pip install -r requirements.txt
 
       # --------------------------------------------------------
-      # Preprocess latest dataset
+      # Merge updated_salary_data.csv into salary_data.csv
+      # if the upload file exists in the repository.
+      #
+      # This step runs BEFORE evaluation so the model is
+      # always evaluated against the most complete dataset.
+      #
+      # After merging:
+      # - salary_data.csv contains all old + new rows
+      # - updated_salary_data.csv is deleted
+      # - Changes are committed back to the branch
+      # --------------------------------------------------------
+      - name: Merge updated dataset if present
+
+        shell: bash
+
+        run: |
+
+          if [ -f "data/updated_salary_data.csv" ]; then
+
+            echo "Found updated_salary_data.csv — merging into salary_data.csv"
+
+            python src/merge_data.py
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            # Stage the merged main file
+            git add data/salary_data.csv
+
+            # Remove updated file from git tracking and disk
+            git rm --cached data/updated_salary_data.csv 2>/dev/null || true
+
+            git commit -m "data: merge updated_salary_data.csv into salary_data.csv [ct-pipeline]" \
+              || echo "Nothing to commit"
+
+            git push origin HEAD:${{ github.ref_name }}
+
+            echo "Merge complete — updated_salary_data.csv deleted"
+
+          else
+
+            echo "No updated_salary_data.csv found — using existing salary_data.csv"
+
+          fi
+
+      # --------------------------------------------------------
+      # Preprocess latest dataset after merge
       # --------------------------------------------------------
       - name: Preprocess data
         run: python src/preprocess.py --data data/salary_data.csv
 
       # --------------------------------------------------------
-      # Evaluate current production model
+      # Evaluate current production model and decide
+      # whether retraining is required.
       #
       # Logic:
+      # - If updated_salary_data.csv was present → ALWAYS retrain
+      #   because new data means the model needs updating
       # - If no model exists → retrain required
       # - If model fails evaluation → retrain required
       # - If force_retrain=true → retrain required
+      # - Otherwise → skip retraining (model is healthy)
       # --------------------------------------------------------
       - name: Check model performance
 
@@ -139,29 +210,43 @@ jobs:
         run: |
 
           # ----------------------------------------------------
-          # Safe fallback for non-manual events
-          #
-          # workflow_dispatch provides inputs
-          # push/schedule do not
+          # Safe fallback for non-manual events.
+          # workflow_dispatch provides inputs but push/schedule
+          # do not, so we default to 'false' if not set.
           # ----------------------------------------------------
           FORCE_RETRAIN="${{ github.event.inputs.force_retrain || 'false' }}"
 
           # ----------------------------------------------------
+          # If updated_salary_data.csv was present when this
+          # workflow started, new data has been uploaded.
+          # Always retrain when new data arrives so the model
+          # learns from the latest available information.
+          # We check git log for the merge commit as the file
+          # has already been deleted by the merge step above.
+          # ----------------------------------------------------
+          if git log -1 --pretty=format:"%s" | grep -q "merge updated_salary_data.csv"; then
+
+            echo "New data was merged — forcing retraining"
+            FORCE_RETRAIN="true"
+
+          fi
+
+          # ----------------------------------------------------
           # If stable model does not exist,
-          # force retraining
+          # force retraining from scratch
           # ----------------------------------------------------
           if [ ! -f "models/model_stable.joblib" ]; then
 
-            echo "No stable model found."
+            echo "No stable model found — retraining required"
 
             echo "needs_retraining=true" >> $GITHUB_OUTPUT
-
             echo "current_r2=0.0" >> $GITHUB_OUTPUT
 
           else
 
             # ------------------------------------------------
-            # Evaluate existing model
+            # Evaluate existing model against test set.
+            # evaluate.py exits with code 1 if R2 < 0.80
             # ------------------------------------------------
             if python src/evaluate.py --model models/model_stable.joblib; then
               EVAL_EXIT_CODE=0
@@ -177,7 +262,9 @@ jobs:
             echo "current_r2=${R2}" >> $GITHUB_OUTPUT
 
             # ------------------------------------------------
-            # Decide whether retraining is required
+            # Decide whether retraining is required.
+            # Retrain if: model failed threshold OR forced.
+            # Skip if: model is healthy and no new data.
             # ------------------------------------------------
             if [ $EVAL_EXIT_CODE -ne 0 ] || [ "$FORCE_RETRAIN" = "true" ]; then
 
@@ -185,6 +272,7 @@ jobs:
 
             else
 
+              echo "Model is healthy — skipping retraining"
               echo "needs_retraining=false" >> $GITHUB_OUTPUT
 
             fi
@@ -192,7 +280,8 @@ jobs:
           fi
 
       # --------------------------------------------------------
-      # Write summary to GitHub Actions UI
+      # Write summary table to GitHub Actions UI so the
+      # result is visible at a glance without opening logs
       # --------------------------------------------------------
       - name: Print summary
 
@@ -212,13 +301,14 @@ jobs:
   # ============================================================
   # Job 2 — Retrain Model
   #
-  # Runs only when retraining is required.
+  # Runs only when retraining is required (decided by Job 1).
+  # If needs_retraining=false this entire job is skipped.
   #
   # Tasks:
-  # - preprocess data
-  # - train new model
-  # - evaluate new model
-  # - commit updated artifacts
+  # - preprocess combined dataset
+  # - train new Random Forest model
+  # - evaluate new model against threshold
+  # - commit updated model + metrics back to repo
   # ============================================================
 
   retrain:
@@ -232,16 +322,21 @@ jobs:
     # ----------------------------------------------------------
     # IMPORTANT:
     # Job IDs containing hyphens must use bracket notation
+    # in conditional expressions.
     # ----------------------------------------------------------
     if: needs['check-performance'].outputs.needs_retraining == 'true'
 
+    # ----------------------------------------------------------
+    # Write permission is required so the bot can commit the
+    # new model file and metrics.json back to the repository.
+    # ----------------------------------------------------------
     permissions:
       contents: write
 
     steps:
 
       # --------------------------------------------------------
-      # Checkout repository
+      # Checkout repository with token for push access
       # --------------------------------------------------------
       - name: Checkout repository
 
@@ -249,6 +344,8 @@ jobs:
 
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Pull latest commit including any merges from Job 1
+          ref: ${{ github.ref_name }}
 
       # --------------------------------------------------------
       # Setup Python
@@ -267,13 +364,14 @@ jobs:
         run: pip install -r requirements.txt
 
       # --------------------------------------------------------
-      # Preprocess latest dataset
+      # Preprocess the combined dataset
+      # (includes any newly merged rows from Job 1)
       # --------------------------------------------------------
       - name: Preprocess data
         run: python src/preprocess.py --data data/salary_data.csv
 
       # --------------------------------------------------------
-      # Train model
+      # Train a new Random Forest model on the full dataset
       # --------------------------------------------------------
       - name: Train model
 
@@ -284,14 +382,19 @@ jobs:
           python src/train.py
 
       # --------------------------------------------------------
-      # Evaluate newly trained model
+      # Evaluate newly trained model.
+      # If R2 < 0.80 this step fails and the pipeline stops —
+      # the old model stays deployed (automatic rollback).
       # --------------------------------------------------------
       - name: Evaluate trained model
 
         run: python src/evaluate.py --model models/model_stable.joblib
 
       # --------------------------------------------------------
-      # Commit updated model + metrics
+      # Commit the new model file and updated metrics back
+      # to the repository so the codebase stays in sync.
+      # The version string from metrics.json is included in
+      # the commit message for traceability.
       # --------------------------------------------------------
       - name: Commit new model
 
@@ -312,7 +415,8 @@ jobs:
           git push origin HEAD:${{ github.ref_name }}
 
       # --------------------------------------------------------
-      # Upload retrained model as workflow artifact
+      # Upload retrained model as workflow artifact so the
+      # Docker build job can download and bake it into the image
       # --------------------------------------------------------
       - name: Upload model artifact
 
@@ -328,8 +432,14 @@ jobs:
   # ============================================================
   # Job 3 — Rebuild Docker Image
   #
-  # Builds a new Docker image containing
-  # the latest trained model.
+  # Only runs after a successful retrain.
+  # Builds a new Docker image containing the latest model
+  # and pushes it to GitHub Container Registry with two tags:
+  #   - latest: always points to newest image on this branch
+  #   - ct-<run_number>: unique tag per CT run for traceability
+  #
+  # The repo name is converted to lowercase because GHCR
+  # requires all image names to be lowercase.
   # ============================================================
 
   rebuild-image:
@@ -341,13 +451,14 @@ jobs:
     needs: retrain
 
     permissions:
-      contents: read
-      packages: write
+      contents: read   # needed to check out the repository
+      packages: write  # needed to push image to GHCR
 
     steps:
 
       # --------------------------------------------------------
-      # Checkout latest repository state
+      # Checkout at latest commit to pick up the new model
+      # file committed by the retrain job above
       # --------------------------------------------------------
       - name: Checkout repository
 
@@ -369,16 +480,17 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # --------------------------------------------------------
-      # Setup Docker Buildx
+      # Setup Docker Buildx for layer caching support
       # --------------------------------------------------------
       - name: Setup Docker Buildx
 
         uses: docker/setup-buildx-action@v3
 
       # --------------------------------------------------------
-      # Convert repository name to lowercase
-      #
-      # GHCR requires lowercase image names
+      # Convert repository name to lowercase.
+      # github.repository returns GauravSSaini005/salary-mlops
+      # but GHCR requires gauravssaini005/salary-mlops.
+      # tr '[:upper:]' '[:lower:]' replaces capitals with lowercase.
       # --------------------------------------------------------
       - name: Set lowercase repo name
 
@@ -391,7 +503,8 @@ jobs:
           echo "repo_lc=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       # --------------------------------------------------------
-      # Build and push Docker image
+      # Build the Docker image and push it with both tags.
+      # Uses the lowercase repo name from the previous step.
       # --------------------------------------------------------
       - name: Build and push image
 
@@ -410,13 +523,23 @@ jobs:
   # ============================================================
   # Job 4 — Redeploy to Kubernetes
   #
-  # Performs rolling restart after image push.
+  # Only runs after the new image is pushed.
+  # Uses a self-hosted runner on the Google Cloud VM so it has
+  # direct network access to the Kind Kubernetes cluster.
+  #
+  # Performs a rolling restart — Kubernetes replaces pods one
+  # by one so the service stays available throughout.
+  #
+  # If the smoke test fails after deployment, the rollback step
+  # automatically reverts to the previous working revision.
   # ============================================================
 
   redeploy:
 
     name: Redeploy to Kubernetes
 
+    # Self-hosted runner runs directly on the Google Cloud VM
+    # so it can reach the Kind cluster via localhost
     runs-on: self-hosted
 
     needs: rebuild-image
@@ -430,7 +553,7 @@ jobs:
         uses: actions/checkout@v4
 
       # --------------------------------------------------------
-      # Install kubectl
+      # Install kubectl on the self-hosted runner
       # --------------------------------------------------------
       - name: Setup kubectl
 
@@ -440,7 +563,9 @@ jobs:
           version: "v1.29.0"
 
       # --------------------------------------------------------
-      # Configure kubeconfig
+      # Decode the kubeconfig from the GitHub secret and write
+      # it to disk so kubectl knows which cluster to connect to.
+      # chmod 600 ensures only the current user can read it.
       # --------------------------------------------------------
       - name: Configure kubectl
 
@@ -455,7 +580,9 @@ jobs:
           chmod 600 ~/.kube/config
 
       # --------------------------------------------------------
-      # Trigger rolling restart
+      # Trigger a rolling restart of the deployment.
+      # Kubernetes pulls the latest image and replaces pods
+      # one by one. We wait 120 seconds for all pods to be ready.
       # --------------------------------------------------------
       - name: Rolling restart
 
@@ -468,7 +595,10 @@ jobs:
           kubectl rollout status deployment/salary-mlops --timeout=120s
 
       # --------------------------------------------------------
-      # Basic deployment health check
+      # Send a real HTTP request to the /health endpoint to
+      # confirm the API responds correctly after deployment.
+      # sleep 15 gives pods time to fully initialise.
+      # curl -sf fails if the response is not HTTP 200.
       # --------------------------------------------------------
       - name: Smoke test
 
@@ -483,7 +613,15 @@ jobs:
           curl -sf http://${NODE_IP}:30500/health
 
       # --------------------------------------------------------
-      # Roll back deployment if redeploy fails
+      # Automatic rollback on failure.
+      #
+      # If ANY step in this job fails (smoke test, rollout etc),
+      # this step runs automatically and reverts Kubernetes to
+      # the previous working deployment revision.
+      #
+      # This means the live API is never left in a broken state.
+      # The 2>/dev/null suppresses errors if no previous
+      # revision exists (e.g. on the very first deployment).
       # --------------------------------------------------------
       - name: Rollback on failure
 
