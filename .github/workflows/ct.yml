@@ -218,9 +218,10 @@ jobs:
 
       # Convert repo name to lowercase
       - name: Set lowercase repo name
+        id: lc
         shell: bash
         run: |
-          echo "REPO_LC=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "repo_lc=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       # Build and push Docker image
       - name: Build and push image
@@ -229,8 +230,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ env.REPO_LC }}:latest
-            ghcr.io/${{ env.REPO_LC }}:ct-${{ github.run_number }}
+            ghcr.io/${{ steps.lc.outputs.repo_lc }}:latest
+            ghcr.io/${{ steps.lc.outputs.repo_lc }}:ct-${{ github.run_number }}
 
   # ============================================================
   # JOB 4 — REDEPLOY TO KUBERNETES
