@@ -105,6 +105,10 @@ jobs:
     # This condition reads the output from the check job.
     # If needs_retraining is false, this entire job is skipped.
     if: needs.check-performance.outputs.needs_retraining == 'true'
+    # Write permission is required so the bot can commit the new model
+    # file and metrics.json back to the repository after retraining.
+    permissions:
+      contents: write
     steps:
       # Check out the repository with the GITHUB_TOKEN so we can push commits back
       - uses: actions/checkout@v4

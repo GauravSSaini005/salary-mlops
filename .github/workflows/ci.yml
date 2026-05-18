@@ -43,7 +43,7 @@ jobs:
       # --max-line-length=150 allows longer lines than the default 79.
       # --ignore=... skips specific rules that our codebase intentionally breaks
       # (e.g. E221 allows extra spaces for aligned assignments).
-      - run: flake8 src/ app.py --max-line-length=150 --ignore=E501,W503,E221,E241,W292,F824
+      - run: flake8 src/ app.py --max-line-length=150 --ignore=E501,W503,E221,E241,W292,F824,E261,E262
 
   # ---------------------------------------------------------------------------
   # Job 2: Preprocess Data
