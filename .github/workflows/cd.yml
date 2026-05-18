@@ -1,0 +1,119 @@
+# ============================================================
+# CD — Continuous Delivery
+# Triggers: push to main only
+# Jobs: Pipeline → Docker Build → Push to GHCR → Deploy to K8s
+# ============================================================
+
+name: CD - Docker Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+
+  pipeline:
+    name: Run ML Pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      - run: python src/preprocess.py --data data/salary_data.csv
+      - run: mkdir -p models && python src/train.py
+      - run: python src/evaluate.py --model models/model_stable.joblib
+      - run: pytest tests/ -v --tb=short
+      - uses: actions/upload-artifact@v4
+        with:
+          name: production-model
+          path: |
+            models/
+            metrics.json
+
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: pipeline
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-model
+          path: .
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.29.0"
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.VM_KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+      - name: Create GHCR pull secret
+        run: |
+          kubectl create secret docker-registry ghcr-secret \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }} \
+            --namespace=default \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Update image in deployment
+        run: |
+          sed -i "s|ghcr.io/YOUR_GITHUB_USERNAME/salary-mlops:latest|ghcr.io/${{ github.repository }}:latest|g" \
+            k8s/deployment.yaml
+      - name: Apply manifests
+        run: |
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/salary-mlops --timeout=120s
+      - name: Smoke test
+        run: |
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+          sleep 10
+          curl -sf http://${NODE_IP}:30500/health
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "🔄 Rolling back..."
+          kubectl rollout undo deployment/salary-mlops
+          kubectl rollout status deployment/salary-mlops --timeout=60s

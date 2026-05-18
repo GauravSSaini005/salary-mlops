@@ -1,0 +1,106 @@
+# ============================================================
+# CI — Continuous Integration
+# Triggers: every push or PR to develop or main
+# Jobs: Lint → Preprocess → Train → Evaluate → Unit Tests
+# ============================================================
+
+name: CI - Build and Test
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install flake8
+      - run: flake8 src/ app.py --max-line-length=120 --ignore=E501,W503
+
+  preprocess:
+    name: Preprocess Data
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      - run: python src/preprocess.py --data data/salary_data.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: processed-data
+          path: data/processed/
+
+  train:
+    name: Train Model
+    runs-on: ubuntu-latest
+    needs: preprocess
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: processed-data
+          path: data/processed/
+      - run: mkdir -p models && python src/train.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: |
+            models/
+            metrics.json
+
+  evaluate:
+    name: Evaluate Model
+    runs-on: ubuntu-latest
+    needs: train
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: processed-data
+          path: data/processed/
+      - uses: actions/download-artifact@v4
+        with:
+          name: trained-model
+          path: .
+      - run: python src/evaluate.py --model models/model_stable.joblib
+      - if: always()
+        run: cat metrics.json
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: [preprocess, train]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: processed-data
+          path: data/processed/
+      - uses: actions/download-artifact@v4
+        with:
+          name: trained-model
+          path: .
+      - run: pytest tests/ -v --tb=short
