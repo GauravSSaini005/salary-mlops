@@ -356,3 +356,10 @@ Age,Gender,Education Level,Job Title,Years of Experience,Salary
 29.0,Male,Bachelor's,Frontend Developer,2.0,59000.0
 42.0,Female,PhD,Research Scientist,12.0,155000.0
 43.0,Male,Master's,Cloud Architect,9.0,125000.0
+42.0,Male,Bachelor's,Software Engineer,7.0,100000.0
+38.0,Male,Master's,Data Scientist,2.0,75000.0
+49.0,Male,PhD,Senior Manager,15.0,150000.0
+33.0,Female,Bachelor's,Sales Associate,7.0,60000.0
+42.0,Male,Master's,Director,20.0,150000.0
+39.0,Male,Bachelor's,Marketing Analyst,2.0,75000.0
+52.0,Female,Master's,Product Manager,12.0,120000.0
