@@ -1,170 +1,305 @@
 # ============================================================
 # CT — Continuous Training
-# Triggers:
-#   1. Weekly schedule
-#   2. New data pushed
-#   3. Manual trigger
 #
-# Flow:
-# Check model → Retrain if needed → Build image → Redeploy
+# Purpose:
+# Automatically monitor model quality and retrain only when needed.
+#
+# Triggers:
+# 1. Weekly schedule
+# 2. Dataset updates
+# 3. Manual trigger from GitHub Actions
+#
+# Pipeline Flow:
+# Check model performance
+#        ↓
+# Retrain model if needed
+#        ↓
+# Rebuild Docker image
+#        ↓
+# Redeploy to Kubernetes
 # ============================================================
 
 name: CT - Continuous Training
 
 on:
-  # Every Monday at 02:00 UTC
+
+  # ------------------------------------------------------------
+  # Run every Monday at 02:00 UTC
+  # Cron format:
+  # ┌───────────── minute (0 - 59)
+  # │ ┌─────────── hour (0 - 23)
+  # │ │ ┌───────── day of month (1 - 31)
+  # │ │ │ ┌─────── month (1 - 12)
+  # │ │ │ │ ┌───── day of week (0 - 6)
+  # │ │ │ │ │
+  # │ │ │ │ │
+  # 0 2 * * 1
+  # ------------------------------------------------------------
   schedule:
     - cron: "0 2 * * 1"
 
-  # Trigger only when dataset changes
+  # ------------------------------------------------------------
+  # Trigger when dataset changes
+  # ------------------------------------------------------------
   push:
-    paths:
-      - "data/salary_data.csv"
     branches:
       - main
       - develop
 
+    paths:
+      - "data/salary_data.csv"
+
+  # ------------------------------------------------------------
   # Manual trigger from GitHub Actions UI
+  # ------------------------------------------------------------
   workflow_dispatch:
     inputs:
+
       force_retrain:
         description: "Force retraining even if model passes evaluation"
+        type: boolean
         required: false
         default: false
-        type: boolean
+
+# ============================================================
+# JOBS
+# ============================================================
 
 jobs:
 
   # ============================================================
-  # JOB 1 — CHECK MODEL PERFORMANCE
+  # Job 1 — Check Current Model Performance
+  #
+  # Evaluates the existing production model against
+  # the R2 threshold.
+  #
+  # Outputs:
+  # - needs_retraining
+  # - current_r2
+  #
+  # These outputs are consumed by downstream jobs.
   # ============================================================
+
   check-performance:
+
     name: Check Current Model Performance
+
     runs-on: ubuntu-latest
 
     outputs:
+
       needs_retraining: ${{ steps.check.outputs.needs_retraining }}
+
       current_r2: ${{ steps.check.outputs.current_r2 }}
 
     steps:
+
+      # --------------------------------------------------------
       # Checkout repository
+      # --------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Setup Python
+      # --------------------------------------------------------
+      # Install Python
+      # --------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
+
         with:
           python-version: "3.13"
 
-      # Install dependencies
+      # --------------------------------------------------------
+      # Install project dependencies
+      # --------------------------------------------------------
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # --------------------------------------------------------
       # Preprocess latest dataset
+      # --------------------------------------------------------
       - name: Preprocess data
         run: python src/preprocess.py --data data/salary_data.csv
 
-      # Evaluate current model
+      # --------------------------------------------------------
+      # Evaluate current production model
+      #
+      # Logic:
+      # - If no model exists → retrain required
+      # - If model fails evaluation → retrain required
+      # - If force_retrain=true → retrain required
+      # --------------------------------------------------------
       - name: Check model performance
+
         id: check
+
         shell: bash
+
         run: |
 
-          # Safe fallback for non-workflow_dispatch events
+          # ----------------------------------------------------
+          # Safe fallback for non-manual events
+          #
+          # workflow_dispatch provides inputs
+          # push/schedule do not
+          # ----------------------------------------------------
           FORCE_RETRAIN="${{ github.event.inputs.force_retrain || 'false' }}"
 
-          # If no model exists yet → force training
+          # ----------------------------------------------------
+          # If stable model does not exist,
+          # force retraining
+          # ----------------------------------------------------
           if [ ! -f "models/model_stable.joblib" ]; then
 
             echo "No stable model found."
 
             echo "needs_retraining=true" >> $GITHUB_OUTPUT
+
             echo "current_r2=0.0" >> $GITHUB_OUTPUT
 
           else
 
-            # Evaluate model
-            python src/evaluate.py --model models/model_stable.joblib
-            EVAL_EXIT_CODE=$?
+            # ------------------------------------------------
+            # Evaluate existing model
+            # ------------------------------------------------
+            if python src/evaluate.py --model models/model_stable.joblib; then
+              EVAL_EXIT_CODE=0
+            else
+              EVAL_EXIT_CODE=1
+            fi
 
-            # Read R2 score
+            # ------------------------------------------------
+            # Read latest R2 score from metrics.json
+            # ------------------------------------------------
             R2=$(python -c "import json; print(json.load(open('metrics.json')).get('r2', 0))")
 
             echo "current_r2=${R2}" >> $GITHUB_OUTPUT
 
-            # Decide retraining
+            # ------------------------------------------------
+            # Decide whether retraining is required
+            # ------------------------------------------------
             if [ $EVAL_EXIT_CODE -ne 0 ] || [ "$FORCE_RETRAIN" = "true" ]; then
+
               echo "needs_retraining=true" >> $GITHUB_OUTPUT
+
             else
+
               echo "needs_retraining=false" >> $GITHUB_OUTPUT
+
             fi
 
           fi
 
-      # GitHub Actions summary
+      # --------------------------------------------------------
+      # Write summary to GitHub Actions UI
+      # --------------------------------------------------------
       - name: Print summary
+
         run: |
+
           echo "## CT Performance Check" >> $GITHUB_STEP_SUMMARY
+
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+
           echo "| R2 Threshold | 0.80 |" >> $GITHUB_STEP_SUMMARY
+
           echo "| Current R2 | ${{ steps.check.outputs.current_r2 }} |" >> $GITHUB_STEP_SUMMARY
+
           echo "| Needs Retraining | ${{ steps.check.outputs.needs_retraining }} |" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================
-  # JOB 2 — RETRAIN MODEL
+  # Job 2 — Retrain Model
+  #
+  # Runs only when retraining is required.
+  #
+  # Tasks:
+  # - preprocess data
+  # - train new model
+  # - evaluate new model
+  # - commit updated artifacts
   # ============================================================
+
   retrain:
+
     name: Retrain Model
+
     runs-on: ubuntu-latest
 
     needs: check-performance
 
-    # FIXED:
-    # Use bracket notation because job ID contains hyphen
+    # ----------------------------------------------------------
+    # IMPORTANT:
+    # Job IDs containing hyphens must use bracket notation
+    # ----------------------------------------------------------
     if: needs['check-performance'].outputs.needs_retraining == 'true'
 
     permissions:
       contents: write
 
     steps:
+
+      # --------------------------------------------------------
       # Checkout repository
+      # --------------------------------------------------------
       - name: Checkout repository
+
         uses: actions/checkout@v4
+
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # --------------------------------------------------------
       # Setup Python
+      # --------------------------------------------------------
       - name: Setup Python
+
         uses: actions/setup-python@v5
+
         with:
           python-version: "3.13"
 
+      # --------------------------------------------------------
       # Install dependencies
+      # --------------------------------------------------------
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Preprocess dataset
+      # --------------------------------------------------------
+      # Preprocess latest dataset
+      # --------------------------------------------------------
       - name: Preprocess data
         run: python src/preprocess.py --data data/salary_data.csv
 
+      # --------------------------------------------------------
       # Train model
+      # --------------------------------------------------------
       - name: Train model
+
         run: |
+
           mkdir -p models
+
           python src/train.py
 
+      # --------------------------------------------------------
       # Evaluate newly trained model
+      # --------------------------------------------------------
       - name: Evaluate trained model
+
         run: python src/evaluate.py --model models/model_stable.joblib
 
+      # --------------------------------------------------------
       # Commit updated model + metrics
+      # --------------------------------------------------------
       - name: Commit new model
+
         shell: bash
+
         run: |
 
           git config user.name "github-actions[bot]"
+
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add models/ metrics.json
@@ -173,22 +308,33 @@ jobs:
 
           git commit -m "chore: retrain model ${VERSION} [ct-pipeline]" || echo "Nothing to commit"
 
-          git push origin ${{ github.ref_name }}
+          git push origin HEAD:${{ github.ref_name }}
 
-      # Upload artifacts for later jobs
+      # --------------------------------------------------------
+      # Upload retrained model as workflow artifact
+      # --------------------------------------------------------
       - name: Upload model artifact
+
         uses: actions/upload-artifact@v4
+
         with:
           name: retrained-model
+
           path: |
             models/
             metrics.json
 
   # ============================================================
-  # JOB 3 — BUILD & PUSH DOCKER IMAGE
+  # Job 3 — Rebuild Docker Image
+  #
+  # Builds a new Docker image containing
+  # the latest trained model.
   # ============================================================
+
   rebuild-image:
+
     name: Rebuild Docker Image
+
     runs-on: ubuntu-latest
 
     needs: retrain
@@ -198,45 +344,76 @@ jobs:
       packages: write
 
     steps:
-      # Checkout latest branch state
+
+      # --------------------------------------------------------
+      # Checkout latest repository state
+      # --------------------------------------------------------
       - name: Checkout repository
+
         uses: actions/checkout@v4
+
         with:
           ref: ${{ github.ref_name }}
 
+      # --------------------------------------------------------
       # Login to GitHub Container Registry
+      # --------------------------------------------------------
       - name: Login to GHCR
+
         uses: docker/login-action@v3
+
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # --------------------------------------------------------
       # Setup Docker Buildx
+      # --------------------------------------------------------
       - name: Setup Docker Buildx
+
         uses: docker/setup-buildx-action@v3
 
-      # Convert repo name to lowercase
+      # --------------------------------------------------------
+      # Convert repository name to lowercase
+      #
+      # GHCR requires lowercase image names
+      # --------------------------------------------------------
       - name: Set lowercase repo name
+
         id: lc
+
         shell: bash
+
         run: |
+
           echo "repo_lc=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
+      # --------------------------------------------------------
       # Build and push Docker image
+      # --------------------------------------------------------
       - name: Build and push image
+
         uses: docker/build-push-action@v5
+
         with:
+
           context: .
+
           push: true
+
           tags: |
             ghcr.io/${{ steps.lc.outputs.repo_lc }}:latest
             ghcr.io/${{ steps.lc.outputs.repo_lc }}:ct-${{ github.run_number }}
 
   # ============================================================
-  # JOB 4 — REDEPLOY TO KUBERNETES
+  # Job 4 — Redeploy to Kubernetes
+  #
+  # Performs rolling restart after image push.
   # ============================================================
+
   redeploy:
+
     name: Redeploy to Kubernetes
 
     runs-on: self-hosted
@@ -244,19 +421,30 @@ jobs:
     needs: rebuild-image
 
     steps:
+
+      # --------------------------------------------------------
       # Checkout repository
+      # --------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --------------------------------------------------------
       # Install kubectl
+      # --------------------------------------------------------
       - name: Setup kubectl
+
         uses: azure/setup-kubectl@v3
+
         with:
           version: "v1.29.0"
 
+      # --------------------------------------------------------
       # Configure kubeconfig
+      # --------------------------------------------------------
       - name: Configure kubectl
+
         shell: bash
+
         run: |
 
           mkdir -p ~/.kube
@@ -265,18 +453,26 @@ jobs:
 
           chmod 600 ~/.kube/config
 
-      # Rolling restart
+      # --------------------------------------------------------
+      # Trigger rolling restart
+      # --------------------------------------------------------
       - name: Rolling restart
+
         shell: bash
+
         run: |
 
           kubectl rollout restart deployment/salary-mlops --namespace=default
 
           kubectl rollout status deployment/salary-mlops --timeout=120s
 
-      # Smoke test
+      # --------------------------------------------------------
+      # Basic deployment health check
+      # --------------------------------------------------------
       - name: Smoke test
+
         shell: bash
+
         run: |
 
           sleep 15
@@ -285,10 +481,15 @@ jobs:
 
           curl -sf http://${NODE_IP}:30500/health
 
-      # Rollback if deployment fails
+      # --------------------------------------------------------
+      # Roll back deployment if redeploy fails
+      # --------------------------------------------------------
       - name: Rollback on failure
+
         if: failure()
+
         shell: bash
+
         run: |
 
           echo "Rolling back after failed CT redeploy..."
