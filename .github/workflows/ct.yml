@@ -268,6 +268,23 @@ jobs:
       # --------------------------------------------------------
       # Preprocess latest dataset
       # --------------------------------------------------------
+
+# Merge updated dataset into main dataset if it exists
+      - name: Merge updated dataset if present
+        run: |
+          if [ -f "data/updated_salary_data.csv" ]; then
+            echo "Found updated_salary_data.csv — merging into salary_data.csv"
+            python src/merge_data.py
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add data/salary_data.csv
+            git rm --cached data/updated_salary_data.csv 2>/dev/null || true
+            git commit -m "data: merge updated_salary_data.csv into salary_data.csv [ct-pipeline]" || echo "Nothing to commit"
+            git push origin HEAD:${{ github.ref_name }}
+          else
+            echo "No updated_salary_data.csv found — using existing salary_data.csv"
+          fi
+
       - name: Preprocess data
         run: python src/preprocess.py --data data/salary_data.csv
 

@@ -1,0 +1,65 @@
+# ============================================================
+# Data Validation Workflow
+#
+# Triggers when updated_salary_data.csv is pushed to any branch.
+# Validates the new dataset before it can be merged to main.
+#
+# This acts as a quality gate — if the data is invalid,
+# the PR cannot be merged and the CT pipeline never runs.
+# ============================================================
+
+name: Data Validation
+
+on:
+  push:
+    paths:
+      - "data/updated_salary_data.csv"
+    branches:
+      - "feature/*"
+      - develop
+
+  pull_request:
+    paths:
+      - "data/updated_salary_data.csv"
+    branches:
+      - develop
+      - main
+
+jobs:
+
+  validate:
+    name: Validate New Dataset
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Validate the uploaded dataset structure and values
+      - name: Validate updated_salary_data.csv
+        run: python src/validate_data.py --data data/updated_salary_data.csv
+
+      # Show a preview of the new data rows
+      - name: Preview new data
+        run: |
+          echo "## New Data Preview" >> $GITHUB_STEP_SUMMARY
+          echo "Rows in update file:" >> $GITHUB_STEP_SUMMARY
+          python -c "
+          import pandas as pd
+          df = pd.read_csv('data/updated_salary_data.csv')
+          print(f'Total rows: {len(df)}')
+          print(df.head(5).to_string())
+          " >> $GITHUB_STEP_SUMMARY
+
+      - name: Validation passed
+        run: |
+          echo "## Validation Result" >> $GITHUB_STEP_SUMMARY
+          echo "Dataset is valid and ready to merge" >> $GITHUB_STEP_SUMMARY
