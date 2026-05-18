@@ -48,6 +48,7 @@ on:
 
     paths:
       - "data/salary_data.csv"
+      - "data/updated_salary_data.csv"
 
   # ------------------------------------------------------------
   # Manual trigger from GitHub Actions UI
