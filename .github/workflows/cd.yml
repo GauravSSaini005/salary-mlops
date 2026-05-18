@@ -170,7 +170,7 @@ jobs:
       # repository path for this GitHub account before applying it to the cluster.
       - name: Update image in deployment
         run: |
-          sed -i "s|ghcr.io/YOUR_GITHUB_USERNAME/salary-mlops:latest|ghcr.io/${{ github.repository }}:latest|g" \
+          sed -i "s|ghcr.io/gauravssaini005/salary-mlops:latest|ghcr.io/${{ github.repository }}:latest|g" \
             k8s/deployment.yaml
 
       # Apply all three Kubernetes manifest files in the correct order:
