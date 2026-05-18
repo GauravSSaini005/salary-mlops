@@ -1,11 +1,14 @@
 # ============================================================
 # CI — Continuous Integration
 # Triggers: every push or PR to develop or main
-# Jobs: Lint → Preprocess → Train → Evaluate → Unit Tests
+# Jobs: Lint -> Preprocess -> Train -> Evaluate -> Unit Tests
 # ============================================================
 
 name: CI - Build and Test
 
+# This workflow runs on every push to develop or main, and on every pull request
+# targeting those branches. It acts as a quality gate — if any job fails,
+# the code should not be merged or deployed further.
 on:
   push:
     branches: [develop, main]
@@ -14,48 +17,99 @@ on:
 
 jobs:
 
+  # ---------------------------------------------------------------------------
+  # Job 1: Lint Code
+  # Checks that all Python source files follow consistent style rules.
+  # This runs first because there is no point training a model if the
+  # code has obvious formatting or syntax problems.
+  # ---------------------------------------------------------------------------
   lint:
     name: Lint Code
     runs-on: ubuntu-latest
     steps:
+      # Check out the repository so the runner can see our source files
       - uses: actions/checkout@v4
+
+      # Install Python 3.13 on the runner
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      # Install flake8, which is the linting tool. We only need this one package
+      # here — no need to install the full requirements.txt just to lint.
       - run: pip install flake8
+
+      # Run flake8 against the src/ folder and app.py.
+      # --max-line-length=150 allows longer lines than the default 79.
+      # --ignore=... skips specific rules that our codebase intentionally breaks
+      # (e.g. E221 allows extra spaces for aligned assignments).
       - run: flake8 src/ app.py --max-line-length=150 --ignore=E501,W503,E221,E241,W292,F824
 
+  # ---------------------------------------------------------------------------
+  # Job 2: Preprocess Data
+  # Only runs after lint passes (needs: lint).
+  # Cleans the raw CSV and produces the processed data files that every
+  # later job depends on. The output is uploaded as an artifact so the
+  # train and test jobs can download it without re-running this step.
+  # ---------------------------------------------------------------------------
   preprocess:
     name: Preprocess Data
     runs-on: ubuntu-latest
-    needs: lint
+    needs: lint  # do not start until lint has passed
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      # Install the full set of dependencies needed to run our Python scripts
       - run: pip install -r requirements.txt
+
+      # Run the preprocessing script against the raw salary CSV.
+      # This script cleans the data, engineers features, and writes the
+      # processed output files into data/processed/.
       - run: python src/preprocess.py --data data/salary_data.csv
+
+      # Save the processed data folder as an artifact so downstream jobs
+      # (train and test) can download it instead of re-running preprocessing.
       - uses: actions/upload-artifact@v4
         with:
           name: processed-data
           path: data/processed/
 
+  # ---------------------------------------------------------------------------
+  # Job 3: Train Model
+  # Only runs after preprocessing is done (needs: preprocess).
+  # Downloads the processed data, trains a fresh model, and uploads both
+  # the model file and metrics.json as an artifact for the evaluate and test jobs.
+  # ---------------------------------------------------------------------------
   train:
     name: Train Model
     runs-on: ubuntu-latest
-    needs: preprocess
+    needs: preprocess  # do not start until processed data is available
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
       - run: pip install -r requirements.txt
+
+      # Download the processed data artifact produced by the preprocess job
       - uses: actions/download-artifact@v4
         with:
           name: processed-data
           path: data/processed/
+
+      # Create the models folder if it does not exist, then train the model.
+      # The training script reads from data/processed/ and writes the
+      # trained model file into models/.
       - run: mkdir -p models && python src/train.py
+
+      # Upload the trained model and metrics file as an artifact so the
+      # evaluate and test jobs can use them without retraining from scratch.
       - uses: actions/upload-artifact@v4
         with:
           name: trained-model
@@ -63,44 +117,82 @@ jobs:
             models/
             metrics.json
 
+  # ---------------------------------------------------------------------------
+  # Job 4: Evaluate Model
+  # Only runs after training is complete (needs: train).
+  # Downloads both the processed data and the trained model, then checks
+  # whether the model meets the R2 quality threshold defined in evaluate.py.
+  # If the threshold is not met, this job fails and blocks any deployment.
+  # ---------------------------------------------------------------------------
   evaluate:
     name: Evaluate Model
     runs-on: ubuntu-latest
-    needs: train
+    needs: train  # do not start until the model has been trained and uploaded
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
       - run: pip install -r requirements.txt
+
+      # Download the processed data so the evaluation script can access
+      # the test split it needs to measure model performance
       - uses: actions/download-artifact@v4
         with:
           name: processed-data
           path: data/processed/
+
+      # Download the trained model and metrics.json into the current directory
       - uses: actions/download-artifact@v4
         with:
           name: trained-model
           path: .
+
+      # Run the evaluation script against the stable model.
+      # This script reads the test data, scores the model, and exits with
+      # a non-zero code if the R2 score falls below the acceptable threshold.
       - run: python src/evaluate.py --model models/model_stable.joblib
+
+      # Print the full contents of metrics.json to the log regardless of whether
+      # the evaluation passed or failed. if: always() ensures this runs even
+      # when the evaluate step above fails, so we can see why it failed.
       - if: always()
         run: cat metrics.json
 
+  # ---------------------------------------------------------------------------
+  # Job 5: Unit Tests
+  # Runs in parallel with evaluate — it needs preprocess and train to be done,
+  # but does not wait for evaluate to finish. This saves time on the overall run.
+  # Downloads both artifacts and runs the full pytest suite against them.
+  # ---------------------------------------------------------------------------
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
-    needs: [preprocess, train]
+    needs: [preprocess, train]  # starts as soon as both artifacts are ready
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
       - run: pip install -r requirements.txt
+
+      # Download the processed data so tests that read from data/processed/ work correctly
       - uses: actions/download-artifact@v4
         with:
           name: processed-data
           path: data/processed/
+
+      # Download the trained model so tests that load the model file work correctly
       - uses: actions/download-artifact@v4
         with:
           name: trained-model
           path: .
+
+      # Run all tests in the tests/ folder.
+      # -v prints each test name as it runs so failures are easy to locate.
+      # --tb=short shows a compact traceback rather than the full one.
       - run: pytest tests/ -v --tb=short

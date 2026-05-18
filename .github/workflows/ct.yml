@@ -1,17 +1,21 @@
 # ============================================================
 # CT — Continuous Training
 # Triggers: weekly, new data pushed, or manual
-# If R2 drops below 0.80 → retrain → rebuild → redeploy
+# If R2 drops below 0.80 -> retrain -> rebuild -> redeploy
 # ============================================================
 
 name: CT - Continuous Training
 
+# This workflow runs automatically in three situations:
+# 1. On a schedule — every Monday at 02:00 UTC (cron format: minute hour day month weekday)
+# 2. When new data is pushed to the CSV file on main or develop branches
+# 3. Manually from the GitHub Actions tab, with an optional force retrain toggle
 on:
   schedule:
     - cron: "0 2 * * 1"
   push:
     paths:
-      - "data/salary_data.csv"
+      - "data/salary_data.csv"  # only triggers if this specific file changed
     branches: [main, develop]
   workflow_dispatch:
     inputs:
@@ -22,59 +26,111 @@ on:
 
 jobs:
 
+  # ---------------------------------------------------------------------------
+  # Job 1: Check Current Model Performance
+  # Evaluates the existing model against the R2 threshold.
+  # Passes a yes/no decision and the current R2 score to the next job
+  # using GitHub Actions job outputs, so we only retrain when actually needed.
+  # ---------------------------------------------------------------------------
   check-performance:
     name: Check Current Model Performance
     runs-on: ubuntu-latest
     outputs:
+      # These two values are set inside the check step below and made available
+      # to downstream jobs so they can read needs_retraining and current_r2.
       needs_retraining: ${{ steps.check.outputs.needs_retraining }}
       current_r2: ${{ steps.check.outputs.current_r2 }}
     steps:
+      # Check out the repository so we can access the model and data files
       - uses: actions/checkout@v4
+
+      # Install Python 3.13 on the runner
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      # Install all required Python packages
       - run: pip install -r requirements.txt
+
+      # Preprocess the latest data so the evaluation uses up-to-date inputs
       - run: python src/preprocess.py --data data/salary_data.csv
+
+      # Decide whether retraining is needed.
+      # This step writes its decision into GITHUB_OUTPUT so other jobs can read it.
       - name: Check model performance
         id: check
         run: |
+          # If no stable model file exists yet, we must train one from scratch
           if [ ! -f "models/model_stable.joblib" ]; then
             echo "needs_retraining=true" >> $GITHUB_OUTPUT
             echo "current_r2=0.0" >> $GITHUB_OUTPUT
           else
+            # Run evaluate.py and capture its exit code.
+            # Exit code 0 means the model passed; anything else means it failed the threshold.
             python src/evaluate.py --model models/model_stable.joblib && PASS=0 || PASS=1
+
+            # Read the R2 score out of metrics.json using a short inline Python command
             R2=$(python -c "import json; print(json.load(open('metrics.json')).get('r2',0))")
             echo "current_r2=${R2}" >> $GITHUB_OUTPUT
+
+            # Mark retraining as needed if the model failed the threshold OR
+            # if the user manually triggered this workflow with force_retrain set to true
             if [ $PASS -ne 0 ] || [ "${{ github.event.inputs.force_retrain }}" == "true" ]; then
               echo "needs_retraining=true" >> $GITHUB_OUTPUT
             else
               echo "needs_retraining=false" >> $GITHUB_OUTPUT
             fi
           fi
+
+      # Write a summary table to the GitHub Actions run page so the result
+      # is visible at a glance without opening the full log
       - name: Print summary
         run: |
           echo "## CT Performance Check" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| R² Threshold | 0.80 |" >> $GITHUB_STEP_SUMMARY
+          echo "| R2 Threshold | 0.80 |" >> $GITHUB_STEP_SUMMARY
           echo "| Needs Retraining | ${{ steps.check.outputs.needs_retraining }} |" >> $GITHUB_STEP_SUMMARY
 
+  # ---------------------------------------------------------------------------
+  # Job 2: Retrain Model
+  # Only runs if the check job decided retraining is needed.
+  # Trains a fresh model, evaluates it, then commits the new model file
+  # and metrics.json back to the repository so the codebase stays in sync.
+  # ---------------------------------------------------------------------------
   retrain:
     name: Retrain Model
     runs-on: ubuntu-latest
     needs: check-performance
+    # This condition reads the output from the check job.
+    # If needs_retraining is false, this entire job is skipped.
     if: needs.check-performance.outputs.needs_retraining == 'true'
     steps:
+      # Check out the repository with the GITHUB_TOKEN so we can push commits back
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
       - run: pip install -r requirements.txt
+
+      # Preprocess the data again on this fresh runner environment
       - run: python src/preprocess.py --data data/salary_data.csv
+
+      # Create the models folder if needed, then run the training script
       - run: mkdir -p models && python src/train.py
+
+      # Confirm the newly trained model meets the quality threshold before committing it
       - run: python src/evaluate.py --model models/model_stable.joblib
+
+      # Commit the new model file and updated metrics back to the branch.
+      # We read the version string from metrics.json so the commit message
+      # clearly shows which model version was saved.
+      # The "|| echo Nothing to commit" prevents the step from failing if the
+      # model file was identical to the previous one.
       - name: Commit new model
         run: |
           git config user.name "github-actions[bot]"
@@ -83,6 +139,9 @@ jobs:
           VERSION=$(python -c "import json; print(json.load(open('metrics.json'))['version'])")
           git commit -m "chore: retrain model ${VERSION} [ct-pipeline]" || echo "Nothing to commit"
           git push origin ${{ github.ref_name }}
+
+      # Upload the retrained model as an artifact so the Docker build job
+      # can download it and bake it into the new image
       - uses: actions/upload-artifact@v4
         with:
           name: retrained-model
@@ -90,23 +149,39 @@ jobs:
             models/
             metrics.json
 
+  # ---------------------------------------------------------------------------
+  # Job 3: Rebuild Docker Image
+  # Only runs after a successful retrain (needs: retrain).
+  # Builds a new Docker image that includes the freshly trained model
+  # and pushes it to GitHub Container Registry with two tags:
+  #   - latest: always points to the most recent image on this branch
+  #   - ct-<run_number>: a unique tag per CT run for traceability
+  # ---------------------------------------------------------------------------
   rebuild-image:
     name: Rebuild Docker Image
     runs-on: ubuntu-latest
     needs: retrain
     permissions:
-      contents: read
-      packages: write
+      contents: read   # needed to check out the repository
+      packages: write  # needed to push the image to GitHub Container Registry
     steps:
+      # Check out the branch at its latest commit so we pick up the model
+      # file that was just committed by the retrain job above
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
+
+      # Log in to GitHub Container Registry using the built-in GITHUB_TOKEN
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Set up Docker Buildx for layer caching support
       - uses: docker/setup-buildx-action@v3
+
+      # Build the image and push it with both tags in one step
       - uses: docker/build-push-action@v5
         with:
           context: .
@@ -115,33 +190,60 @@ jobs:
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:ct-${{ github.run_number }}
 
+  # ---------------------------------------------------------------------------
+  # Job 4: Redeploy to Kubernetes
+  # Only runs after the new image is pushed (needs: rebuild-image).
+  # Uses a self-hosted runner because it needs direct network access to the cluster.
+  # Performs a rolling restart so the cluster pulls the new image with zero downtime.
+  # ---------------------------------------------------------------------------
   redeploy:
     name: Redeploy to Kubernetes
-    #runs-on: ubuntu-latest
+    # runs-on: ubuntu-latest  -- commented out; self-hosted runner used instead
+    # A self-hosted runner is a machine you control that has kubectl access to the cluster
     runs-on: self-hosted
     needs: rebuild-image
     steps:
+      # Check out the repository to access the k8s manifest files if needed
       - uses: actions/checkout@v4
+
+      # Install kubectl v1.29.0 on the runner
       - uses: azure/setup-kubectl@v3
         with:
           version: "v1.29.0"
+
+      # Decode and write the kubeconfig so kubectl knows which cluster to connect to.
+      # The config is stored base64-encoded in a secret to keep credentials safe.
+      # chmod 600 ensures only the current user can read the file.
       - name: Configure kubectl
         run: |
           mkdir -p ~/.kube
           echo "${{ secrets.VM_KUBECONFIG }}" | base64 -d > ~/.kube/config
           chmod 600 ~/.kube/config
+
+      # Trigger a rolling restart of the deployment.
+      # Kubernetes will pull the latest image tag and replace pods one by one,
+      # keeping the service available throughout. We wait up to 120 seconds
+      # for all new pods to become ready before moving on.
       - name: Rolling restart
         run: |
           kubectl rollout restart deployment/salary-mlops --namespace=default
           kubectl rollout status deployment/salary-mlops --timeout=120s
+
+      # Run a quick health check to confirm the newly deployed pods are responding.
+      # sleep 15 gives the service a moment to fully initialise after the rollout.
+      # curl -sf returns a non-zero exit code if the HTTP response is not successful,
+      # which will cause this step to fail and trigger the rollback below.
       - name: Smoke test
         run: |
           sleep 15
           NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
           curl -sf http://${NODE_IP}:30500/health
+
+      # If any step in this job failed, roll back to the previous working deployment.
+      # This runs only on failure (if: failure()) and will not block a successful run.
       - name: Rollback on failure
         if: failure()
         run: |
-          echo "🔄 Rolling back after failed CT redeploy..."
+          echo "Rolling back after failed CT redeploy..."
           kubectl rollout undo deployment/salary-mlops
           kubectl rollout status deployment/salary-mlops --timeout=60s

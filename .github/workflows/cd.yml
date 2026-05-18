@@ -1,35 +1,64 @@
 # ============================================================
 # CD — Continuous Delivery
 # Triggers: push to main only
-# Jobs: Pipeline → Docker Build → Push to GHCR → Deploy to K8s
+# Jobs: Pipeline -> Docker Build -> Push to GHCR -> Deploy to K8s
 # ============================================================
 
 name: CD - Docker Build and Deploy
 
+# This workflow runs automatically when code is pushed to the main branch.
+# It can also be triggered manually from the GitHub Actions tab using workflow_dispatch.
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+# These environment variables are available to every job in this workflow.
+# REGISTRY points to GitHub's own container registry.
+# IMAGE_NAME is automatically set to your repository path (e.g. username/repo-name).
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
 
+  # ---------------------------------------------------------------------------
+  # Job 1: ML Pipeline
+  # Runs the full machine learning pipeline — preprocess, train, evaluate, test.
+  # If any step fails, the pipeline stops here and the Docker build never starts.
+  # ---------------------------------------------------------------------------
   pipeline:
     name: Run ML Pipeline
     runs-on: ubuntu-latest
     steps:
+      # Check out the repository code so the runner can access all our files
       - uses: actions/checkout@v4
+
+      # Install Python 3.13 on the runner machine
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      # Install all Python dependencies listed in requirements.txt
       - run: pip install -r requirements.txt
+
+      # Clean and prepare the raw CSV data for training
       - run: python src/preprocess.py --data data/salary_data.csv
+
+      # Create the models folder if it does not exist, then train the model.
+      # The trained model file will be saved into the models/ folder.
       - run: mkdir -p models && python src/train.py
+
+      # Evaluate the trained model against quality thresholds.
+      # If the model does not meet the R2 threshold, this step will fail.
       - run: python src/evaluate.py --model models/model_stable.joblib
+
+      # Run the automated test suite to make sure nothing is broken.
+      # -v gives verbose output; --tb=short shows a short traceback on failure.
       - run: pytest tests/ -v --tb=short
+
+      # Save the trained model and metrics file as a workflow artifact
+      # so the next job (Docker build) can download and include them in the image.
       - uses: actions/upload-artifact@v4
         with:
           name: production-model
@@ -37,24 +66,40 @@ jobs:
             models/
             metrics.json
 
+  # ---------------------------------------------------------------------------
+  # Job 2: Docker Build and Push
+  # Only runs if the ML pipeline job above passed successfully (needs: pipeline).
+  # Builds a Docker image containing the trained model and pushes it to GHCR.
+  # ---------------------------------------------------------------------------
   docker:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    needs: pipeline
+    needs: pipeline  # this job will not start until the pipeline job finishes successfully
     permissions:
-      contents: read
-      packages: write
+      contents: read   # needed to check out the repository
+      packages: write  # needed to push the image to GitHub Container Registry
     steps:
+      # Check out the repository so we have access to the Dockerfile
       - uses: actions/checkout@v4
+
+      # Download the trained model artifact that was uploaded by the pipeline job.
+      # We place it in the current directory (.) so the Dockerfile can copy it in.
       - uses: actions/download-artifact@v4
         with:
           name: production-model
           path: .
+
+      # Log in to GitHub Container Registry using the built-in GITHUB_TOKEN.
+      # This token is automatically created by GitHub for each workflow run.
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Generate the image tags automatically based on the current commit and branch.
+      # sha- tag: a short unique tag per commit (e.g. sha-a1b2c3d) for traceability.
+      # latest tag: applied only when pushing to the default branch (main).
       - uses: docker/metadata-action@v5
         id: meta
         with:
@@ -62,7 +107,12 @@ jobs:
           tags: |
             type=sha,prefix=sha-,format=short
             type=raw,value=latest,enable={{is_default_branch}}
+
+      # Set up Docker Buildx, which supports advanced features like layer caching
       - uses: docker/setup-buildx-action@v3
+
+      # Build the Docker image from our Dockerfile and push it to GHCR.
+      # cache-from and cache-to reuse layers from previous builds to speed things up.
       - uses: docker/build-push-action@v5
         with:
           context: .
@@ -72,21 +122,41 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # ---------------------------------------------------------------------------
+  # Job 3: Deploy to Kubernetes
+  # Only runs if the Docker build job passed (needs: docker).
+  # Runs on a self-hosted runner because it needs direct access to the cluster.
+  # ---------------------------------------------------------------------------
   deploy:
     name: Deploy to Kubernetes
-    #runs-on: ubuntu-latest
+    # runs-on: ubuntu-latest  -- commented out; we use a self-hosted runner instead
+    # A self-hosted runner is a machine you control that has access to your cluster.
     runs-on: self-hosted
-    needs: docker
+    needs: docker  # this job will not start until the Docker image is successfully pushed
     steps:
+      # Check out the repository so we have access to the k8s manifest files
       - uses: actions/checkout@v4
+
+      # Install kubectl version v1.29.0 on the runner so we can talk to Kubernetes
       - uses: azure/setup-kubectl@v3
         with:
           version: "v1.29.0"
+
+      # Write the kubeconfig file to the runner so kubectl knows which cluster to talk to.
+      # The kubeconfig is stored as a base64-encoded secret to keep it safe.
+      # base64 -d decodes it back to the original YAML file before saving.
+      # chmod 600 locks the file so only the current user can read it.
       - name: Configure kubectl
         run: |
           mkdir -p ~/.kube
           echo "${{ secrets.VM_KUBECONFIG }}" | base64 -d > ~/.kube/config
           chmod 600 ~/.kube/config
+
+      # Create (or update) a Kubernetes secret that allows the cluster to pull
+      # our private Docker image from GitHub Container Registry.
+      # --dry-run=client -o yaml | kubectl apply means: generate the secret definition
+      # locally without sending it to the cluster, then pipe it into apply so it is
+      # created if missing or updated if it already exists.
       - name: Create GHCR pull secret
         run: |
           kubectl create secret docker-registry ghcr-secret \
@@ -95,23 +165,41 @@ jobs:
             --docker-password=${{ secrets.GITHUB_TOKEN }} \
             --namespace=default \
             --dry-run=client -o yaml | kubectl apply -f -
+
+      # Replace the placeholder image name in deployment.yaml with the real
+      # repository path for this GitHub account before applying it to the cluster.
       - name: Update image in deployment
         run: |
           sed -i "s|ghcr.io/YOUR_GITHUB_USERNAME/salary-mlops:latest|ghcr.io/${{ github.repository }}:latest|g" \
             k8s/deployment.yaml
+
+      # Apply all three Kubernetes manifest files in the correct order:
+      # configmap first (config values), then deployment (the pods), then service (networking).
       - name: Apply manifests
         run: |
           kubectl apply -f k8s/configmap.yaml
           kubectl apply -f k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
+
+      # Wait up to 120 seconds for the new pods to become ready.
+      # If they do not become ready in time, this step fails and triggers the rollback.
       - name: Wait for rollout
         run: |
           kubectl rollout status deployment/salary-mlops --timeout=120s
+
+      # Run a quick health check against the live service to confirm it is responding.
+      # NODE_IP gets the IP address of the first node in the cluster.
+      # sleep 10 gives the service a moment to fully start before we hit it.
+      # curl -sf fails silently on HTTP errors and raises a non-zero exit code if the request fails.
       - name: Smoke test
         run: |
           NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
           sleep 10
           curl -sf http://${NODE_IP}:30500/health
+
+      # If any previous step in this job failed, roll back to the last working deployment.
+      # The || echo lines prevent the rollback itself from causing a second failure
+      # if there is no previous revision to go back to.
       - name: Rollback on failure
         if: failure()
         run: |
