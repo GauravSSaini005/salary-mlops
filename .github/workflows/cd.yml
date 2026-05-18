@@ -115,6 +115,6 @@ jobs:
       - name: Rollback on failure
         if: failure()
         run: |
-          echo "🔄 Rolling back..."
-          kubectl rollout undo deployment/salary-mlops
-          kubectl rollout status deployment/salary-mlops --timeout=60s
+          echo "Rolling back..."
+          kubectl rollout undo deployment/salary-mlops 2>/dev/null || echo "No previous revision to rollback to"
+          kubectl rollout status deployment/salary-mlops --timeout=60s 2>/dev/null || echo "Rollback status check skipped"
