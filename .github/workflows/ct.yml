@@ -76,16 +76,18 @@ jobs:
   #
   # This job does two things:
   # 1. Merges updated_salary_data.csv into salary_data.csv
-  #    if a new upload file is detected. This always happens
-  #    regardless of whether retraining is needed.
+  #    if the file has new data rows (more than just the header).
+  #    After merging, the file is CLEARED back to header only —
+  #    it is NOT deleted. This means the file always stays in
+  #    the repo ready for the next batch of new data.
   # 2. Evaluates the existing model against the R2 threshold
   #    and decides whether retraining is required.
   #
   # Key logic:
-  # - New data file detected → ALWAYS retrain (new data = new model)
-  # - Model R2 below 0.80   → retrain required
-  # - force_retrain=true     → retrain required
-  # - Model R2 above 0.80    → skip retraining
+  # - New data rows detected  → ALWAYS retrain
+  # - Model R2 below 0.80     → retrain required
+  # - force_retrain=true      → retrain required
+  # - Model R2 above 0.80     → skip retraining
   #
   # Outputs:
   # - needs_retraining (true/false)
@@ -100,8 +102,8 @@ jobs:
 
     # ----------------------------------------------------------
     # Write permission is needed so this job can commit the
-    # merged salary_data.csv back to the repository and
-    # delete updated_salary_data.csv after merging.
+    # merged salary_data.csv and cleared updated_salary_data.csv
+    # back to the repository after merging.
     # ----------------------------------------------------------
     permissions:
       contents: write
@@ -139,47 +141,56 @@ jobs:
 
       # --------------------------------------------------------
       # Merge updated_salary_data.csv into salary_data.csv
-      # if the upload file exists in the repository.
+      # if the file has more than just the header row.
       #
-      # This step runs BEFORE evaluation so the model is
-      # always evaluated against the most complete dataset.
+      # IMPORTANT: After merging, the file is CLEARED back to
+      # header only — NOT deleted. This keeps the file in the
+      # repo permanently so the user can add new data next time
+      # without having to recreate the file.
       #
-      # After merging:
-      # - salary_data.csv contains all old + new rows
-      # - updated_salary_data.csv is deleted
-      # - Changes are committed back to the branch
+      # wc -l counts the number of lines in the file.
+      # If lines > 1, it means there are data rows beyond the header.
       # --------------------------------------------------------
       - name: Merge updated dataset if present
 
         shell: bash
 
         run: |
+
+          # Count lines in the update file (header = 1 line, data rows = more)
           LINES=$(wc -l < "data/updated_salary_data.csv" 2>/dev/null || echo "0")
+
           if [ -f "data/updated_salary_data.csv" ] && [ "$LINES" -gt "1" ]; then
 
-            echo "Found updated_salary_data.csv — merging into salary_data.csv"
+            echo "Found $((LINES - 1)) new data rows — merging into salary_data.csv"
 
+            # Run the merge script which:
+            # 1. Reads both CSV files
+            # 2. Combines them
+            # 3. Removes duplicates
+            # 4. Saves combined data back to salary_data.csv
+            # 5. Clears updated_salary_data.csv back to header only
             python src/merge_data.py
 
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
 
-            # Stage the merged main file
+            # Stage both files:
+            # - salary_data.csv now has the merged combined data
+            # - updated_salary_data.csv now has only the header row
             git add data/salary_data.csv
-
-            # Remove updated file from git tracking and disk
-            git rm --cached data/updated_salary_data.csv 2>/dev/null || true
+            git add data/updated_salary_data.csv
 
             git commit -m "data: merge updated_salary_data.csv into salary_data.csv [ct-pipeline]" \
               || echo "Nothing to commit"
 
             git push origin HEAD:${{ github.ref_name }}
 
-            echo "Merge complete — updated_salary_data.csv deleted"
+            echo "Merge complete — updated_salary_data.csv cleared to header only"
 
           else
 
-            echo "No updated_salary_data.csv found — using existing salary_data.csv"
+            echo "No new data rows in updated_salary_data.csv — skipping merge"
 
           fi
 
@@ -194,7 +205,7 @@ jobs:
       # whether retraining is required.
       #
       # Logic:
-      # - If updated_salary_data.csv was present → ALWAYS retrain
+      # - If updated_salary_data.csv had data → ALWAYS retrain
       #   because new data means the model needs updating
       # - If no model exists → retrain required
       # - If model fails evaluation → retrain required
@@ -217,12 +228,9 @@ jobs:
           FORCE_RETRAIN="${{ github.event.inputs.force_retrain || 'false' }}"
 
           # ----------------------------------------------------
-          # If updated_salary_data.csv was present when this
-          # workflow started, new data has been uploaded.
-          # Always retrain when new data arrives so the model
-          # learns from the latest available information.
-          # We check git log for the merge commit as the file
-          # has already been deleted by the merge step above.
+          # Check git log to see if the merge step above
+          # committed new data. If it did, force retraining
+          # because new data means the model should be updated.
           # ----------------------------------------------------
           if git log -1 --pretty=format:"%s" | grep -q "merge updated_salary_data.csv"; then
 
@@ -336,7 +344,9 @@ jobs:
     steps:
 
       # --------------------------------------------------------
-      # Checkout repository with token for push access
+      # Checkout repository with token for push access.
+      # ref: github.ref_name ensures we get the latest commit
+      # including the data merge done by Job 1 above.
       # --------------------------------------------------------
       - name: Checkout repository
 
@@ -344,7 +354,6 @@ jobs:
 
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # Pull latest commit including any merges from Job 1
           ref: ${{ github.ref_name }}
 
       # --------------------------------------------------------
