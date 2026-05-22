@@ -1,13 +1,13 @@
 {
-  "mae": 10638.89,
-  "mse": 158976548.16,
-  "rmse": 12608.59,
-  "r2": 0.9258,
-  "version": "v9",
-  "timestamp": "2026-05-22T12:20:40.111970",
+  "mae": 10304.69,
+  "mse": 192023580.77,
+  "rmse": 13857.26,
+  "r2": 0.9153,
+  "version": "v10",
+  "timestamp": "2026-05-22T12:36:23.536532",
   "r2_threshold": 0.8,
   "passed_threshold": true,
-  "eval_r2": 0.9258,
-  "eval_mae": 10638.89,
+  "eval_r2": 0.9153,
+  "eval_mae": 10304.69,
   "eval_passed": true
 }
