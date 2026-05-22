@@ -363,3 +363,13 @@ Age,Gender,Education Level,Job Title,Years of Experience,Salary
 42.0,Male,Master's,Director,20.0,150000.0
 39.0,Male,Bachelor's,Marketing Analyst,2.0,75000.0
 52.0,Female,Master's,Product Manager,12.0,120000.0
+55.0,Male,PhD,Chief Executive Officer,25.0,350000.0
+33.0,Female,Master's,AI Engineer,7.0,125000.0
+28.0,Male,Bachelor's,QA Engineer,4.0,62000.0
+47.0,Female,PhD,Head of Data Science,20.0,185000.0
+36.0,Male,Master's,Backend Engineer,10.0,105000.0
+29.0,Female,Bachelor's,Business Analyst,4.0,65000.0
+43.0,Male,PhD,Engineering Director,16.0,195000.0
+25.0,Female,Master's,Junior Data Scientist,1.0,55000.0
+38.0,Male,Bachelor's,Project Manager,12.0,88000.0
+32.0,Female,Master's,DevOps Engineer,6.0,95000.0
