@@ -52,9 +52,12 @@ def merge():
     merged_df.to_csv(MAIN_DATA_PATH, index=False)
     log.info(f"Merged dataset saved to {MAIN_DATA_PATH}")
 
-    # Delete the update file
-    os.remove(UPDATE_DATA_PATH)
-    log.info(f"Deleted update file: {UPDATE_DATA_PATH}")
+    # Clear the update file instead of deleting it
+    # This keeps the file in the repo but removes all data rows
+    # so it is ready for the next batch of new data
+    with open(UPDATE_DATA_PATH, "w") as f:
+        f.write("Age,Gender,Education Level,Job Title,Years of Experience,Salary\n")
+    log.info(f"Cleared update file (kept headers): {UPDATE_DATA_PATH}")
 
     return after
 
