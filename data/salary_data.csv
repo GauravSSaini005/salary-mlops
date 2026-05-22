@@ -383,3 +383,23 @@ Age,Gender,Education Level,Job Title,Years of Experience,Salary
 33.0,Male,Bachelor's,Sales Manager,4.0,80000.0
 27.0,Female,Bachelor's,Marketing Coordinator,1.0,45000.0
 29.0,Female,Bachelor's,Business Analyst,3.0,65000.0
+28.0,Male,Bachelor's,Software Engineer,4.0,72000.0
+35.0,Female,Master's,Data Scientist,8.0,110000.0
+42.0,Male,PhD,Senior Manager,15.0,145000.0
+26.0,Female,Bachelor's,Junior Analyst,2.0,45000.0
+50.0,Male,PhD,Director,22.0,185000.0
+31.0,Female,Master's,Product Manager,6.0,95000.0
+38.0,Male,Bachelor's,Sales Manager,11.0,82000.0
+29.0,Female,Master's,UX Designer,5.0,78000.0
+45.0,Male,PhD,Principal Engineer,18.0,165000.0
+33.0,Female,Bachelor's,Marketing Manager,8.0,88000.0
+27.0,Male,Master's,Data Analyst,3.0,65000.0
+48.0,Female,PhD,VP of Engineering,20.0,195000.0
+24.0,Male,Bachelor's,Graduate Developer,1.0,42000.0
+36.0,Female,Master's,Business Analyst,9.0,92000.0
+52.0,Male,PhD,Chief Technology Officer,25.0,220000.0
+30.0,Female,Bachelor's,HR Manager,6.0,68000.0
+43.0,Male,Master's,Cloud Architect,14.0,135000.0
+25.0,Female,Bachelor's,Frontend Developer,2.0,52000.0
+55.0,Male,PhD,Chief Executive Officer,28.0,280000.0
+32.0,Female,Master's,DevOps Engineer,7.0,98000.0
